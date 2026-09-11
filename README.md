@@ -6,7 +6,7 @@
 
 | 파일 | 도구 |
 |---|---|
-| `checkin-event-tool.jsx` | check IN EVENT — 체크인 라이브 이벤트 영상 대판 조립 |
+| `check-in-event-tool.jsx` | check IN EVENT — 체크인 라이브 이벤트 영상 대판 조립 |
 
 ## 왜 공개 저장소인가
 

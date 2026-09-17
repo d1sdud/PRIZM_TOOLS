@@ -247,16 +247,32 @@ function flatten(words) {
     return { text: text, at: at };
 }
 
+/* 프레임 이름에서 나레이션에 나올 만한 알맹이만 남깁니다.
+     "22-1. 드로우 이벤트"                  → "드로우이벤트"
+     "이벤트 당첨 팝업 이미지_재구매 이벤트"  → "재구매이벤트"
+   앞의 번호(22-1. / 19. / 7-01.)는 CMS 컴포넌트 번호라 나레이션에 안 나오고,
+   밑줄 앞은 "당첨 팝업 이미지" 같은 갈래 이름이라 역시 안 나옵니다.
+   번호는 뒤에 점이나 띄어쓰기가 따라올 때만 뗍니다 — "2인 비교" 의 2 까지 떼면 안 되니까요. */
+function searchKey(name) {
+    var s = String(name).replace(/^[0-9][0-9\-]*[.\s]+/, "");
+    var u = s.lastIndexOf("_");
+    if (u >= 0) { s = s.substring(u + 1); }
+    return s.replace(/\s+/g, "");
+}
+
 /* 이벤트 이름이 나레이션에 처음 나오는 시각을 찾습니다.
-   "8. 구매 인증 이벤트" → "구매인증이벤트" 로 만들어 찾고, 못 찾으면 "이벤트" 를
-   떼고 한 번 더 봅니다("상한가 슬라이딩" 처럼 이름이 다른 경우가 있어서). */
+   앞 이벤트가 걸린 자리 뒤에서만 찾습니다 — "구매 인증" 처럼 뒤에서 또 나오는 말이 있어서,
+   그냥 처음부터 찾으면 순서가 뒤엉킵니다. 그래서 고른 순서 = 나레이션 순서여야 합니다.
+   못 찾으면 "이벤트" 를 떼고 한 번 더 봅니다("상한가 슬라이딩" 처럼 다른 경우가 있어서). */
 function findEventTimes(flat, picked, lead) {
     var from = 0, out = [], missed = [];
     for (var i = 0; i < picked.length; i++) {
-        var raw = picked[i].name.replace(/^[0-9]+[.\s]*/, "").replace(/\s+/g, "");
-        var hit = flat.text.indexOf(raw, from);
-        if (hit < 0 && raw.length > 4) { hit = flat.text.indexOf(raw.replace(/이벤트$/, ""), from); }
-        if (hit < 0) { missed.push(picked[i].name); out.push(null); continue; }
+        var key = searchKey(picked[i].name);
+        var hit = flat.text.indexOf(key, from);
+        if (hit < 0 && key.length > 4) {
+            hit = flat.text.indexOf(key.replace(/이벤트$/, ""), from);
+        }
+        if (hit < 0) { missed.push(picked[i].name + " (\"" + key + "\" 로 찾음)"); out.push(null); continue; }
         from = hit + 1;
         var tName = flat.at[hit];
         out.push([Math.max(0, tName - lead), tName]);   /* [상단, 하단] */
@@ -500,6 +516,14 @@ function build(thisObj) {
             if (r.missed.length) {
                 msg += "\n\n나레이션에서 못 찾은 이벤트 (직접 찍어 주세요) :\n  · "
                      + r.missed.join("\n  · ");
+            }
+            /* 하나도 못 찾았으면 규칙이 아니라 고른 것이 잘못됐을 때가 많습니다.
+               나레이션을 그대로 보여 주고 대조하게 합니다. */
+            if (!n) {
+                msg += "\n\n하나도 못 찾았습니다. 둘 중 하나입니다.\n"
+                     + "  · 나레이션에 없는 프레임을 골랐다\n"
+                     + "  · 고른 순서가 나레이션 순서와 다르다"
+                     + "\n\n받아쓴 나레이션 :\n" + flat.text.substr(0, 400);
             }
             alert(msg);
         } catch (e) {

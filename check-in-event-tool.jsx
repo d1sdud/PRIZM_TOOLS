@@ -67,7 +67,10 @@ function curlJSON(url, token) {
     /* ExtendScript 에는 JSON.parse 가 없어서 eval 로 읽습니다.
        상대는 https 로 붙은 api.figma.com 이고, 토큰도 내 것이라 그대로 씁니다. */
     try { return eval("(" + body + ")"); }
-    catch (e2) { throw new Error("피그마 응답을 읽지 못했습니다.\n\n" + body.substr(0, 300)); }
+    catch (e2) {
+        throw new Error("피그마 응답을 읽지 못했습니다. (" + Math.round(body.length / 1024) + " KB)\n\n"
+            + e2.toString() + "\n\n" + body.substr(0, 300));
+    }
 }
 
 /* 주소에서 파일 키와 노드 번호를 뽑습니다.
@@ -415,8 +418,11 @@ function build(thisObj) {
             state.fileKey = u.key;
             say("피그마에서 불러오는 중… (잠시 멈춥니다)");
 
+            /* depth=3 — 대지(1) > 이벤트 프레임(2) > 그 안의 레이어(3) 까지만 받습니다.
+               이게 없으면 피그마가 글자 하나까지 다 내려보내서 (대지 하나에 800 개쯤)
+               응답이 몇 메가바이트가 되고, 그러면 아래 eval 이 통째로 터집니다. */
             var doc = curlJSON("https://api.figma.com/v1/files/" + u.key
-                               + "/nodes?ids=" + encodeURIComponent(u.node), tok.text);
+                               + "/nodes?depth=3&ids=" + encodeURIComponent(u.node), tok.text);
             var wrap = doc.nodes && doc.nodes[u.node];
             if (!wrap) { throw new Error("그 주소에서 회차 대지를 못 찾았습니다."); }
 

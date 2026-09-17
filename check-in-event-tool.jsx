@@ -417,7 +417,7 @@ function build(thisObj) {
     var g3 = w.add("panel", undefined, "영상에 넣을 이벤트 (위에서부터 나오는 순서)");
     g3.orientation = "column"; g3.alignChildren = ["fill", "top"]; g3.margins = 10;
     var list = g3.add("listbox", undefined, [], { multiselect: true });
-    list.preferredSize = [280, 160];
+    list.preferredSize = [-1, 160];
     var hint = g3.add("statictext", undefined, "주소를 넣고 [불러오기] 를 누르세요.");
 
     /* --- 조립 --- */
@@ -441,7 +441,7 @@ function build(thisObj) {
     var goBtn = g4.add("button", undefined, "소스 받고 조립하기");
 
     var log = w.add("statictext", undefined, "", { multiline: true });
-    log.preferredSize = [280, 32];
+    log.preferredSize = [-1, 32];
 
     function say(s) { log.text = s; w.update && w.update(); }
 
@@ -568,8 +568,16 @@ function build(thisObj) {
         }
     };
 
+    /* 창 크기가 바뀔 때마다 다시 잡아 줍니다.
+       이게 없으면 처음 한 번 잡은 제일 작은 크기 그대로 굳어서,
+       패널을 아무리 넓혀도 글자가 잘린 채 왼쪽에 몰려 있습니다. */
+    w.onResizing = w.onResize = function () {
+        try { this.layout.resize(); } catch (e) {}
+    };
+
+    w.layout.layout(true);
+    w.layout.resize();
     if (w instanceof Window) { w.center(); w.show(); }
-    else { w.layout.layout(true); w.layout.resize(); }
     return w;
 }
 

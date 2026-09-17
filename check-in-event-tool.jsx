@@ -50,11 +50,20 @@ function readAll(f) {
      "스크립트가 파일에 쓰고 네트워크에 액세스하도록 허용" 이 켜져 있어야 합니다. */
 function curlJSON(url, token) {
     var out = tmpFile("res.json");
-    var cmd = "/usr/bin/curl -fsSL --max-time 60"
+    var cmd = "/usr/bin/curl -fsSL --max-time 180"
             + " -H " + q("X-Figma-Token: " + token)
-            + " " + q(url) + " -o " + q(out.fsName);
-    try { system.callSystem(cmd); }
+            + " " + q(url) + " -o " + q(out.fsName) + " ; echo CURL:$?";
+    var log;
+    try { log = String(system.callSystem(cmd)); }
     catch (e) { throw new Error("피그마에 연결하지 못했습니다. (" + e.toString() + ")"); }
+
+    /* curl 은 실패해도 조용하고, 받다 만 파일은 그대로 남습니다.
+       그걸 모르고 읽으면 "문자열 상수가 종결되지 않았습니다" 같은 엉뚱한 소리를 듣게 됩니다. */
+    var code = log.match(/CURL:(\d+)/);
+    if (code && code[1] !== "0") {
+        throw new Error("피그마에서 받다가 끊겼습니다. (curl " + code[1] + ")\n\n"
+            + log.replace(/CURL:\d+/, "").substr(0, 300));
+    }
 
     var body = out.exists ? readAll(out) : null;
     if (!body) {
@@ -124,16 +133,41 @@ function findEvents(section) {
     });
     var out = [];
     for (var i = 0; i < found.length; i++) {
-        var layers = eventLayers(found[i]);
-        if (layers.length) { out.push({ name: found[i].name, layers: layers }); }
+        out.push({ id: found[i].id, name: found[i].name, layers: null });
     }
     return out;
+}
+
+/* 고른 이벤트의 자식 레이어만 뒤늦게 받아 옵니다.
+   회차 대지 하나에 프레임이 74 개, 그 아래까지 합치면 노드가 수천 개라
+   한 번에 받으면 응답이 20 MB 를 넘고 ExtendScript 가 읽다 죽습니다.
+   실제로 쓰는 건 그중 대여섯 개뿐이라, 고른 뒤에 그것만 받습니다. */
+function fetchLayers(token, picked) {
+    var ids = [], i;
+    for (i = 0; i < picked.length; i++) {
+        if (!picked[i].layers) { ids.push(picked[i].id); }
+    }
+    if (!ids.length) { return; }
+
+    var res = curlJSON("https://api.figma.com/v1/files/" + state.fileKey
+                       + "/nodes?depth=2&ids=" + encodeURIComponent(ids.join(",")), token);
+    for (i = 0; i < picked.length; i++) {
+        if (picked[i].layers) { continue; }
+        var w = res.nodes && res.nodes[picked[i].id];
+        if (!w || !w.document) { throw new Error("이벤트를 못 찾았습니다 : " + picked[i].name); }
+        picked[i].layers = eventLayers(w.document);
+        if (!picked[i].layers.length) {
+            throw new Error("내보낼 레이어가 없습니다 : " + picked[i].name
+                + "\n배경만 있는 프레임이거나, 레이어가 하나로 합쳐져 있습니다.");
+        }
+    }
 }
 
 
 /* ============ 소스 내려받기 ============ */
 
 function downloadSources(token, picked, destFolder) {
+    fetchLayers(token, picked);
     var ids = [], i, j;
     for (i = 0; i < picked.length; i++) {
         for (j = 0; j < picked[i].layers.length; j++) { ids.push(picked[i].layers[j].id); }
@@ -418,19 +452,17 @@ function build(thisObj) {
             state.fileKey = u.key;
             say("피그마에서 불러오는 중… (잠시 멈춥니다)");
 
-            /* depth=3 — 대지(1) > 이벤트 프레임(2) > 그 안의 레이어(3) 까지만 받습니다.
-               이게 없으면 피그마가 글자 하나까지 다 내려보내서 (대지 하나에 800 개쯤)
-               응답이 몇 메가바이트가 되고, 그러면 아래 eval 이 통째로 터집니다. */
+            /* depth=2 — 대지(1) 와 그 직속 프레임(2) 까지만. 이름만 있으면 목록은 만들 수 있고,
+               그 아래 레이어는 [조립] 때 고른 것만 따로 받습니다. */
             var doc = curlJSON("https://api.figma.com/v1/files/" + u.key
-                               + "/nodes?depth=3&ids=" + encodeURIComponent(u.node), tok.text);
+                               + "/nodes?depth=2&ids=" + encodeURIComponent(u.node), tok.text);
             var wrap = doc.nodes && doc.nodes[u.node];
             if (!wrap) { throw new Error("그 주소에서 회차 대지를 못 찾았습니다."); }
 
             state.events = findEvents(wrap.document);
             list.removeAll();
             for (var i = 0; i < state.events.length; i++) {
-                list.add("item", state.events[i].name
-                       + "  (" + state.events[i].layers.length + "장)");
+                list.add("item", state.events[i].name);
             }
             hint.text = "이벤트 " + state.events.length + "개를 찾았습니다. "
                       + "넣을 것만 골라 주세요 (여러 개는 ⌘ 누르고 클릭).";

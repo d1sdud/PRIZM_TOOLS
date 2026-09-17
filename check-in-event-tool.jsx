@@ -237,14 +237,16 @@ function transcribe(audioFile, key) {
 /* 받아쓴 단어들을 띄어쓰기 없는 한 줄로 잇고, 글자 위치 → 시각 표를 만듭니다.
    받아쓰기가 "재 구매" 로 띄든 "재구매" 로 붙이든 똑같이 찾히게 하려는 것입니다. */
 function flatten(words) {
-    var text = "", at = [];
+    var text = "", at = [], end = 0;
     for (var i = 0; i < words.length; i++) {
         var t = String(words[i].text || "").replace(/\s+/g, "");
+        var e = (words[i].end !== undefined) ? words[i].end : words[i].start;
+        if (e > end) { end = e; }
         if (!t) { continue; }
         for (var c = 0; c < t.length; c++) { at.push(words[i].start); }
         text += t;
     }
-    return { text: text, at: at };
+    return { text: text, at: at, end: end };
 }
 
 /* 프레임 이름에서 나레이션에 나올 만한 알맹이만 남깁니다.
@@ -260,24 +262,42 @@ function searchKey(name) {
     return s.replace(/\s+/g, "");
 }
 
-/* 이벤트 이름이 나레이션에 처음 나오는 시각을 찾습니다.
-   앞 이벤트가 걸린 자리 뒤에서만 찾습니다 — "구매 인증" 처럼 뒤에서 또 나오는 말이 있어서,
-   그냥 처음부터 찾으면 순서가 뒤엉킵니다. 그래서 고른 순서 = 나레이션 순서여야 합니다.
-   못 찾으면 "이벤트" 를 떼고 한 번 더 봅니다("상한가 슬라이딩" 처럼 다른 경우가 있어서). */
-function findEventTimes(flat, picked, lead) {
-    var from = 0, out = [], missed = [];
-    for (var i = 0; i < picked.length; i++) {
+/* 이벤트 이름이 "소개되는" 자리를 찾습니다.
+
+   나레이션은 늘 "○○ 이벤트입니다" 로 소개합니다 — 첫 번째 구매 인증 이벤트입니다,
+   마지막, 상한가 슬라이딩입니다. 그래서 이름 뒤에 "입니다" 가 붙은 자리를 먼저 봅니다.
+   "라이브 중 구매 인증 버튼으로" 처럼 본문에 또 나오는 말은 이걸로 걸러집니다.
+   그래서 앞에서부터 차례로 찾을 필요가 없고 — 고른 순서를 신경 쓰지 않아도 됩니다. */
+function findIntro(flat, key) {
+    var i = flat.text.indexOf(key + "입니다");
+    if (i >= 0) { return i; }
+    return flat.text.indexOf(key);
+}
+
+/* 고른 이벤트를 나레이션에 나온 순서로 세우고, 인/아웃 시각을 매깁니다.
+
+   상단은 이름을 말하기 lead 초 전에 들어오고, 다음 이벤트가 들어오기 직전에 나갑니다.
+   나레이션에 없는 이벤트는 빠집니다 — 체크는 넉넉히 해 두고 음성이 정하게 하는 것입니다. */
+function planFromNarration(flat, picked, lead) {
+    var found = [], missed = [], i;
+    for (i = 0; i < picked.length; i++) {
         var key = searchKey(picked[i].name);
-        var hit = flat.text.indexOf(key, from);
-        if (hit < 0 && key.length > 4) {
-            hit = flat.text.indexOf(key.replace(/이벤트$/, ""), from);
-        }
-        if (hit < 0) { missed.push(picked[i].name + " (\"" + key + "\" 로 찾음)"); out.push(null); continue; }
-        from = hit + 1;
-        var tName = flat.at[hit];
-        out.push([Math.max(0, tName - lead), tName]);   /* [상단, 하단] */
+        var at = findIntro(flat, key);
+        if (at < 0 && key.length > 4) { at = findIntro(flat, key.replace(/이벤트$/, "")); }
+        if (at < 0) { missed.push(picked[i].name); continue; }
+        found.push({ ev: picked[i], t: flat.at[at] });
     }
-    return { times: out, missed: missed };
+    found.sort(function (a, b) { return a.t - b.t; });   /* 나레이션 순서 = 영상 순서 */
+
+    var order = [], times = [];
+    for (i = 0; i < found.length; i++) {
+        var tIn  = Math.max(0, found[i].t - lead);
+        var tOut = (i + 1 < found.length) ? Math.max(0, found[i + 1].t - lead) : flat.end;
+        if (tOut <= tIn) { tOut = tIn + 1; }
+        order.push(found[i].ev);
+        times.push([tIn, tOut]);
+    }
+    return { order: order, times: times, missed: missed };
 }
 
 /* 찾은 시각을 컴프 마커로 찍습니다. 사람이 눈으로 보고 끌어서 고칠 수 있게 하려는 것입니다. */
@@ -383,14 +403,29 @@ function assemble(picked, model, times, botDelay) {
 
 /* ============ 화면 ============ */
 
-/* 목록에서 고른 이벤트를 고른 순서대로 돌려줍니다. 안 골랐으면 null. */
-function pickedEvents(list) {
-    var sel = list.selection;
-    if (!sel) { alert("넣을 이벤트를 골라 주세요."); return null; }
-    if (!(sel instanceof Array)) { sel = [sel]; }
+/* 처음부터 켜 둘 것인가.
+   진짜 이벤트 대판은 "…이벤트" / "…슬라이딩" / "…쿠폰" 으로 끝납니다.
+     "8. 구매 인증 이벤트"        → 켬
+     "18-4. 슬라이딩 이용 안내"   → 끔 (안내 대판이다)
+     "…팝업 이미지_재구매 이벤트" → 끔 (당첨 발표용이라 영상에 안 들어간다) */
+function onByDefault(name) {
+    return name.indexOf("_") < 0 && /(이벤트|슬라이딩|쿠폰)\s*$/.test(name);
+}
+
+/* 체크된 이벤트. 순서는 신경 쓰지 않습니다 — 나레이션이 정합니다. */
+function pickedEvents(boxes) {
     var out = [];
-    for (var i = 0; i < sel.length; i++) { out.push(state.events[sel[i].index]); }
+    for (var i = 0; i < boxes.length; i++) {
+        if (boxes[i].cb.value) { out.push(boxes[i].ev); }
+    }
+    if (!out.length) { alert("넣을 이벤트를 하나 이상 체크해 주세요."); return null; }
     return out;
+}
+
+/* 초 → 0:03.2 */
+function clock(t) {
+    var m = Math.floor(t / 60), s = t - m * 60;
+    return m + ":" + (s < 10 ? "0" : "") + (Math.round(s * 10) / 10);
 }
 
 
@@ -430,31 +465,49 @@ function build(thisObj) {
     var loadBtn = g2.add("button", undefined, "불러오기");
 
     /* --- 이벤트 목록 --- */
-    var g3 = w.add("panel", undefined, "영상에 넣을 이벤트 (위에서부터 나오는 순서)");
+    var g3 = w.add("panel", undefined, "영상에 넣을 이벤트");
     g3.orientation = "column"; g3.alignChildren = ["fill", "top"]; g3.margins = 10;
-    var list = g3.add("listbox", undefined, [], { multiselect: true });
-    list.preferredSize = [-1, 160];
     var hint = g3.add("statictext", undefined, "주소를 넣고 [불러오기] 를 누르세요.");
+    var listGroup = g3.add("group");
+    listGroup.orientation = "column";
+    listGroup.alignChildren = ["left", "top"];
+    listGroup.spacing = 3;
+    var boxes = [];
+
+    function fillList() {
+        while (listGroup.children.length) { listGroup.remove(listGroup.children[0]); }
+        boxes = [];
+        var on = 0;
+        for (var i = 0; i < state.events.length; i++) {
+            var ev = state.events[i];
+            var cb = listGroup.add("checkbox", undefined, ev.name);
+            cb.value = onByDefault(ev.name);
+            if (cb.value) { on++; }
+            boxes.push({ cb: cb, ev: ev });
+        }
+        hint.text = "이벤트 " + on + "개를 미리 체크해 뒀습니다. 순서는 안 맞춰도 됩니다 —\n"
+                  + "나레이션에 나온 순서대로 놓고, 나레이션에 없는 것은 뺍니다.";
+        w.layout.layout(true);
+        w.layout.resize();
+    }
 
     /* --- 조립 --- */
     var g4 = w.add("panel", undefined, "조립");
     g4.orientation = "column"; g4.alignChildren = ["fill", "top"]; g4.margins = 10;
     g4.add("statictext", undefined,
-        "① 마커 — 아래 버튼으로 자동, 또는 들으면서 직접 *");
-    var sttBtn = g4.add("button", undefined, "나레이션에서 마커 찍기");
-    g4.add("statictext", undefined,
-        "② 타임라인에서 본보기 레이어를 하나 선택");
+        "타임라인에서 본보기 레이어를 하나 고르고 누르세요.");
+    var sttBtn = g4.add("button", undefined, "나레이션 고르고 한 번에 조립");
     var g4b = g4.add("group"); g4b.orientation = "row";
     g4b.add("statictext", undefined, "하단은 상단보다");
     var delay = g4b.add("edittext", undefined, "0.6");
     delay.characters = 4;
     g4b.add("statictext", undefined, "초 뒤에");
     var g4a = g4.add("group"); g4a.orientation = "row";
-    g4a.add("statictext", undefined, "마커가 없으면 이벤트당");
+    g4a.add("statictext", undefined, "나레이션 없이 할 때는 이벤트당");
     var secs = g4a.add("edittext", undefined, "3");
     secs.characters = 4;
-    g4a.add("statictext", undefined, "초씩 균등하게");
-    var goBtn = g4.add("button", undefined, "소스 받고 조립하기");
+    g4a.add("statictext", undefined, "초씩");
+    var goBtn = g4.add("button", undefined, "나레이션 없이 조립 (마커 또는 균등)");
 
     var log = w.add("statictext", undefined, "", { multiline: true });
     log.preferredSize = [-1, 32];
@@ -476,54 +529,81 @@ function build(thisObj) {
             if (!wrap) { throw new Error("그 주소에서 회차 대지를 못 찾았습니다."); }
 
             state.events = findEvents(wrap.document);
-            list.removeAll();
-            for (var i = 0; i < state.events.length; i++) {
-                list.add("item", state.events[i].name);
-            }
-            hint.text = "이벤트 " + state.events.length + "개를 찾았습니다. "
-                      + "넣을 것만 골라 주세요 (여러 개는 ⌘ 누르고 클릭).";
+            fillList();
             say("");
         } catch (e) { say(""); alert(e.message || e.toString()); }
     };
+
+    /* 본보기 레이어를 집어 옵니다. 없으면 왜 필요한지 알려 줍니다. */
+    function pickModel() {
+        try {
+            var comp = app.project.activeItem;
+            if (comp instanceof CompItem && comp.selectedLayers.length === 1) {
+                return comp.selectedLayers[0];
+            }
+        } catch (e) {}
+        alert("타임라인에서 본보기가 될 레이어를 하나만 골라 주세요.\n\n"
+            + "그 레이어를 복제해서 쓰기 때문에\n"
+            + "인/아웃 애니메이션이 그대로 따라옵니다.");
+        return null;
+    }
+
+    /* 어떤 이벤트가 몇 초에 들어오고 나가는지 — 타임라인을 안 봐도 알 수 있게. */
+    function report(order, times) {
+        var lines = [];
+        for (var i = 0; i < order.length; i++) {
+            lines.push("  " + (i + 1) + ". " + order[i].name
+                     + "   " + clock(times[i][0]) + " → " + clock(times[i][1]));
+        }
+        return lines.join("\n");
+    }
 
     sttBtn.onClick = function () {
         try {
             if (!state.events.length) { alert("먼저 [불러오기] 를 눌러 주세요."); return; }
             if (!xik.text) { alert("일레븐랩스 키를 먼저 넣고 [저장] 을 눌러 주세요."); return; }
-            var picked = pickedEvents(list);
-            if (!picked) { return; }
 
-            var comp = app.project.activeItem;
-            if (!(comp instanceof CompItem)) { alert("컴프를 먼저 열어 주세요."); return; }
+            var picked = pickedEvents(boxes);
+            if (!picked) { return; }
+            var model = pickModel();
+            if (!model) { return; }
 
             var audio = File.openDialog("나레이션 음성 파일을 고르세요 (mp3/wav)");
             if (!audio) { return; }
+            var dest = Folder.selectDialog("소스를 저장할 폴더를 고르세요");
+            if (!dest) { return; }
 
             var lead = parseFloat(delay.text);
-            if (!(lead >= 0)) { lead = 0; }
+            if (!(lead >= 0)) { lead = 0.6; }
 
             say("받아쓰는 중… (음성 길이만큼 걸리고, 그동안 멈춥니다)");
             var flat = flatten(transcribe(audio, xik.text));
-            var r = findEventTimes(flat, picked, lead);
+            var plan = planFromNarration(flat, picked, lead);
 
-            app.beginUndoGroup(TOOL + " 마커");
-            var n = writeMarkers(comp, picked, r.times);
+            if (!plan.order.length) {
+                say("");
+                alert("나레이션에서 이벤트를 하나도 못 찾았습니다.\n\n"
+                    + "체크한 것이 나레이션에 나오는 이벤트가 맞는지 봐 주세요.\n\n"
+                    + "받아쓴 나레이션 :\n" + flat.text.substr(0, 400));
+                return;
+            }
+
+            say("피그마에서 그림 받는 중… (잠시 멈춥니다)");
+            var n = downloadSources(tok.text, plan.order, dest);
+
+            say("컴프에 까는 중…");
+            app.beginUndoGroup(TOOL + " 조립");
+            var r = assemble(plan.order, model, plan.times, lead);
+            /* 마커도 같이 찍어 둡니다 — 나중에 손볼 때 기준점이 됩니다 */
+            try { writeMarkers(model.containingComp, plan.order, plan.times); } catch (eM) {}
             app.endUndoGroup();
             say("");
 
-            var msg = "마커 " + n + "개를 찍었습니다.\n\n"
-                    + "타임라인에서 확인하고, 어긋난 것은 끌어서 옮겨 주세요.";
-            if (r.missed.length) {
-                msg += "\n\n나레이션에서 못 찾은 이벤트 (직접 찍어 주세요) :\n  · "
-                     + r.missed.join("\n  · ");
-            }
-            /* 하나도 못 찾았으면 규칙이 아니라 고른 것이 잘못됐을 때가 많습니다.
-               나레이션을 그대로 보여 주고 대조하게 합니다. */
-            if (!n) {
-                msg += "\n\n하나도 못 찾았습니다. 둘 중 하나입니다.\n"
-                     + "  · 나레이션에 없는 프레임을 골랐다\n"
-                     + "  · 고른 순서가 나레이션 순서와 다르다"
-                     + "\n\n받아쓴 나레이션 :\n" + flat.text.substr(0, 400);
+            var msg = "다 됐습니다. 나레이션에 맞춰 깔았습니다.\n\n"
+                    + report(plan.order, plan.times)
+                    + "\n\n레이어 " + r.made + "장 / 소스 폴더 : " + dest.fsName;
+            if (plan.missed.length) {
+                msg += "\n\n나레이션에 없어서 뺀 것 :\n  · " + plan.missed.join("\n  · ");
             }
             alert(msg);
         } catch (e) {
@@ -536,22 +616,10 @@ function build(thisObj) {
         try {
             if (!state.events.length) { alert("먼저 [불러오기] 를 눌러 주세요."); return; }
 
-            var picked = pickedEvents(list);
+            var picked = pickedEvents(boxes);
             if (!picked) { return; }
-
-            var model = null;
-            try {
-                var comp = app.project.activeItem;
-                if (comp instanceof CompItem && comp.selectedLayers.length === 1) {
-                    model = comp.selectedLayers[0];
-                }
-            } catch (e0) {}
-            if (!model) {
-                alert("타임라인에서 본보기가 될 레이어를 하나만 골라 주세요.\n\n"
-                    + "그 레이어를 복제해서 쓰기 때문에\n"
-                    + "인/아웃 애니메이션이 그대로 따라옵니다.");
-                return;
-            }
+            var model = pickModel();
+            if (!model) { return; }
 
             /* 마커가 있으면 그 구간에, 없으면 균등하게 */
             var times = timesFromMarkers(model.containingComp, picked.length);
@@ -578,14 +646,10 @@ function build(thisObj) {
             app.endUndoGroup();
 
             say("");
-            alert("다 됐습니다.\n\n"
-                + "이벤트 " + picked.length + "개 / 레이어 " + r.made + "장\n"
-                + "소스 폴더 : " + dest.fsName + "\n\n"
-                + (byMarker
-                    ? "컴프 마커에 맞춰 인/아웃을 잡았습니다.\n"
-                    + "하단은 " + botDelay + "초 늦게 넣었습니다."
-                    : "컴프에 마커가 없어서 균등하게 깔았습니다.\n"
-                    + "나레이션에 맞추려면 마커를 찍고 다시 눌러 주세요."));
+            alert("다 됐습니다. " + (byMarker ? "컴프 마커에 맞췄습니다." : "균등하게 깔았습니다.")
+                + "\n\n" + report(picked, times)
+                + "\n\n레이어 " + r.made + "장 / 소스 폴더 : " + dest.fsName
+                + (byMarker ? "" : "\n\n나레이션에 맞추려면 위의 [나레이션 고르고 한 번에 조립] 을 쓰세요."));
         } catch (e) {
             try { app.endUndoGroup(); } catch (e2) {}
             say(""); alert(e.message || e.toString());
